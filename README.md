@@ -59,6 +59,10 @@ streamlit run app.py
 
 `gemini-flash-latest` always points to Google's current Flash model. Google retires older model names over time; if you see a "model not found" error, change the model name in the sidebar.
 
+## Handling Gemini "503 UNAVAILABLE" errors
+
+A 503 means Google's servers are temporarily overloaded; it is not a bug in the app. The app automatically retries up to 3 times (waiting 2s, then 4s), then switches to a lighter backup model (`gemini-flash-lite-latest`). If everything fails, wait a minute and click Analyze again.
+
 ## Deploy on Streamlit Community Cloud
 
 1. Push this repo to GitHub (never commit your API key).
