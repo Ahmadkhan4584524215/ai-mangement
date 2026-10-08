@@ -4,6 +4,7 @@ import io
 import json
 import os
 import re
+import time
 
 import streamlit as st
 from docx import Document
@@ -15,6 +16,9 @@ from pypdf import PdfReader
 # Config
 # ----------------------------------------------------------------------------
 DEFAULT_MODEL = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+FALLBACK_MODELS = ["gemini-flash-lite-latest"]  # tried if the main model stays overloaded
+MAX_RETRIES = 3          # attempts per model for temporary errors
+RETRY_BASE_DELAY = 2     # seconds; doubles each retry (2, 4, ...)
 MAX_FILE_MB = 5
 MAX_CHARS = 20000  # cap text sent to the model
 
@@ -185,7 +189,21 @@ def normalize_result(data: dict) -> dict:
     }
 
 
-def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_description: str) -> dict:
+def _is_transient(exc: Exception) -> bool:
+    """True for temporary errors worth retrying (overload, rate limit, timeouts)."""
+    msg = str(exc).lower()
+    return any(t in msg for t in ("503", "unavailable", "overloaded", "high demand",
+                                  "500", "504", "deadline", "429", "resource_exhausted"))
+
+
+def _is_model_missing(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return "404" in msg or "not_found" in msg or "is not found" in msg
+
+
+def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_description: str,
+                        on_status=None) -> dict:
+    """Call Gemini with retries and model fallback. Raises the last error if all fail."""
     client = genai.Client(api_key=api_key)
     prompt = f"RESUME:\n\"\"\"\n{resume_text[:MAX_CHARS]}\n\"\"\"\n\n"
     if job_description.strip():
@@ -193,15 +211,36 @@ def analyze_with_gemini(api_key: str, model: str, resume_text: str, job_descript
     else:
         prompt += "JOB DESCRIPTION: (not provided - evaluate general ATS-readiness)\n"
 
-    response = client.models.generate_content(
-        model=model,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            response_mime_type="application/json",
-        ),
+    config = types.GenerateContentConfig(
+        system_instruction=SYSTEM_PROMPT,
+        response_mime_type="application/json",
     )
-    return normalize_result(clean_json(response.text))
+    models = [model] + [m for m in FALLBACK_MODELS if m != model]
+    last_exc = None
+
+    for m in models:
+        for attempt in range(MAX_RETRIES):
+            try:
+                response = client.models.generate_content(model=m, contents=prompt, config=config)
+                return normalize_result(clean_json(response.text))
+            except ValueError as e:        # unreadable JSON: retry once more, it is usually random
+                last_exc = e
+                if attempt == MAX_RETRIES - 1:
+                    break
+            except Exception as e:
+                last_exc = e
+                if _is_model_missing(e):   # bad/retired model name: go to the next model
+                    break
+                if not _is_transient(e):   # e.g. invalid API key: retrying will not help
+                    raise
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BASE_DELAY * (2 ** attempt)
+                    if on_status:
+                        on_status(f"Gemini is busy, retrying in {delay}s...")
+                    time.sleep(delay)
+        if on_status and m != models[-1]:
+            on_status(f"Switching to backup model ({models[models.index(m) + 1]})...")
+    raise last_exc
 
 
 def final_score(ai_score: int, rule_score: int) -> int:
@@ -238,6 +277,8 @@ def friendly_error(exc: Exception) -> str:
     low = msg.lower()
     if "api key" in low or "api_key" in low or "permission" in low or "401" in low or "403" in low:
         return "Your Gemini API key looks invalid or lacks permission. Please check it."
+    if "503" in msg or "unavailable" in low or "high demand" in low:
+        return "Google's Gemini servers are overloaded right now (all retries failed). Please try again in a minute."
     if "429" in msg or "quota" in low or "rate" in low or "resource_exhausted" in low:
         return "Gemini rate limit or quota reached. Wait a minute and try again."
     return f"Something went wrong: {msg}"
@@ -290,8 +331,11 @@ def main():
 
         rules = rule_based_checks(text)
         try:
+            status = st.empty()
             with st.spinner("Gemini is analyzing your resume..."):
-                ai = analyze_with_gemini(api_key, model.strip() or DEFAULT_MODEL, text, job_desc)
+                ai = analyze_with_gemini(api_key, model.strip() or DEFAULT_MODEL, text, job_desc,
+                                         on_status=status.info)
+            status.empty()
         except Exception as e:
             st.error(friendly_error(e))
             st.stop()
